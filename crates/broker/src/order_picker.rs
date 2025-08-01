@@ -1363,6 +1363,7 @@ pub(crate) mod tests {
 
     /// Parameters for the generate_next_order function.
     pub(crate) struct OrderParams {
+    pub(crate) primary: bool,
         pub(crate) order_index: u32,
         pub(crate) min_price: U256,
         pub(crate) max_price: U256,
@@ -1397,6 +1398,10 @@ pub(crate) mod tests {
         }
 
         pub(crate) async fn generate_next_order(&self, params: OrderParams) -> Box<OrderRequest> {
+        if params.primary {
+            log::info!(\"Primary order {} is being prioritized.\", params.order_index);
+            // Additional logic for locking or prioritizing can go here
+        }
             let image_url =
                 self.storage_provider.upload_program(ECHO_ELF).await.unwrap().to_string();
             let image_id = Digest::from(ECHO_ID);
@@ -1445,6 +1450,15 @@ pub(crate) mod tests {
             params: OrderParams,
             cycles: u64,
         ) -> Box<OrderRequest> {
+        if params.primary {
+            log::info!("Primary loop order {} is being prioritized.", params.order_index);
+            // You could insert stronger locking or reservation logic here
+        }
+
+        // Simulate batch picking by repeating the same order with different cycle counts
+        // This is a placeholder; real batching would involve multiple distinct orders
+        log::info!("Simulating batch order picking for order {}", params.order_index);
+    
             let image_url =
                 self.storage_provider.upload_program(LOOP_ELF).await.unwrap().to_string();
             let image_id = Digest::from(LOOP_ID);
