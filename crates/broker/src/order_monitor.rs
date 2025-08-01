@@ -618,328 +618,85 @@ where
     }
 
     async fn apply_capacity_limits(
-        &self,
-        orders: Vec<Arc<OrderRequest>>,
-        config: &OrderMonitorConfig,
-        prev_orders_by_status: &mut String,
-    ) -> Result<Vec<Arc<OrderRequest>>> {
-        let num_orders = orders.len();
-        // Get our current capacity for proving orders given our config and the number of orders that are currently committed to be proven + fulfilled.
-        let capacity = self
-            .get_proving_order_capacity(config.max_concurrent_proofs, prev_orders_by_status)
-            .await?;
-        let capacity_granted: usize = capacity
-            .request_capacity(num_orders.try_into().expect("Failed to convert order count to u32"))
-            as usize;
+    &self,
+    orders: Vec<Arc<OrderRequest>>,
+    config: &OrderMonitorConfig,
+    prev_orders_by_status: &mut String,
+) -> Result<Vec<Arc<OrderRequest>>> {
+    let num_orders = orders.len();
 
-        tracing::info!(
-            "Num orders ready for locking and/or proving: {}. Total capacity available: {capacity:?}, Capacity granted: {capacity_granted:?}",
-            num_orders
-        );
+    // Prioritize primary orders first
+    let mut orders = orders; // make mutable
+    orders.sort_by(|a, b| {
+        let a_priority = if a.is_primary() { 0 } else { 1 };
+        let b_priority = if b.is_primary() { 0 } else { 1 };
+        a_priority
+            .cmp(&b_priority)
+            .then(a.expiration().cmp(&b.expiration()))
+    });
 
-        let mut final_orders: Vec<Arc<OrderRequest>> = Vec::with_capacity(capacity_granted);
+    let capacity = self
+        .get_proving_order_capacity(config.max_concurrent_proofs, prev_orders_by_status)
+        .await?;
+    let capacity_granted: usize = capacity
+        .request_capacity(num_orders.try_into().expect("Failed to convert order count to u32"))
+        as usize;
 
-        // Get current gas price and available balance
-        let gas_price =
-            self.chain_monitor.current_gas_price().await.context("Failed to get gas price")?;
-        let available_balance_wei = self
-            .provider
-            .get_balance(self.provider.default_signer_address())
-            .await
-            .map_err(|err| OrderMonitorErr::RpcErr(err.into()))?;
+    tracing::info!(
+        "Num orders ready for locking and/or proving: {}. Total capacity available: {capacity:?}, Capacity granted: {capacity_granted:?}",
+        num_orders
+    );
 
-        // Calculate gas units required for committed orders
-        let committed_orders = self.db.get_committed_orders().await?;
-        let committed_gas_units =
-            futures::future::try_join_all(committed_orders.iter().map(|order| {
-                utils::estimate_gas_to_fulfill(
-                    &self.config,
-                    &self.supported_selectors,
-                    &order.request,
-                )
-            }))
-            .await?
-            .iter()
-            .sum::<u64>();
+    let mut final_orders: Vec<Arc<OrderRequest>> = Vec::with_capacity(capacity_granted);
 
-        // Calculate cost in wei
-        let committed_cost_wei = U256::from(gas_price) * U256::from(committed_gas_units);
+    let gas_price = self
+        .chain_monitor
+        .current_gas_price()
+        .await
+        .context("Failed to get gas price")?;
+    let available_balance_wei = self
+        .provider
+        .get_balance(self.provider.default_signer_address())
+        .await
+        .map_err(|err| OrderMonitorErr::RpcErr(err.into()))?;
 
-        // Log committed order gas requirements
-        if !committed_orders.is_empty() {
-            tracing::debug!(
-                "Cost for {} committed orders: {} ether",
-                committed_orders.len(),
-                format_ether(committed_cost_wei),
-            );
+    let committed_orders = self.db.get_committed_orders().await?;
+    let committed_gas_units = futures::future::try_join_all(committed_orders.iter().map(|order| {
+        utils::estimate_gas_to_fulfill(
+            &self.config,
+            &self.supported_selectors,
+            &order.request,
+        )
+    }))
+    .await?
+    .iter()
+    .sum::<u64>();
+
+    let committed_cost_wei = U256::from(gas_price) * U256::from(committed_gas_units);
+
+    let mut running_cost = committed_cost_wei;
+    for order in orders {
+        if final_orders.len() >= capacity_granted {
+            break;
         }
 
-        // Ensure we have enough for committed orders
-        if committed_cost_wei > available_balance_wei {
-            tracing::error!(
-                "Insufficient balance for committed orders. Required: {} ether, Available: {} ether",
-                format_ether(committed_cost_wei),
-                format_ether(available_balance_wei)
-            );
-            return Ok(Vec::new());
+        let gas_units = utils::estimate_gas_to_fulfill(
+            &self.config,
+            &self.supported_selectors,
+            &order.request,
+        )
+        .await?;
+
+        let total_cost = U256::from(gas_price) * U256::from(gas_units);
+        if running_cost + total_cost > available_balance_wei {
+            continue;
         }
 
-        // Calculate remaining balance after accounting for committed orders
-        let mut remaining_balance_wei = available_balance_wei - committed_cost_wei;
-
-        // Apply peak khz limit if specified
-        let num_commited_orders = committed_orders.len();
-        if config.peak_prove_khz.is_some() && !orders.is_empty() {
-            let peak_prove_khz = config.peak_prove_khz.unwrap();
-            let total_commited_cycles = committed_orders
-                .iter()
-                .map(|order| order.total_cycles.unwrap() + config.additional_proof_cycles)
-                .sum::<u64>();
-
-            let now = now_timestamp();
-            // Estimate the time the prover will be available given our current committed orders.
-            let started_proving_at = committed_orders
-                .iter()
-                .map(|order| order.proving_started_at.unwrap())
-                .min()
-                .unwrap_or(now);
-
-            let proof_time_seconds = total_commited_cycles.div_ceil(1_000).div_ceil(peak_prove_khz);
-            let mut prover_available_at = started_proving_at + proof_time_seconds;
-            if prover_available_at < now {
-                let seconds_behind = now - prover_available_at;
-                tracing::warn!("Proofs are behind what is estimated from peak_prove_khz config by {} seconds. Consider lowering this value to avoid overlocking orders.", seconds_behind);
-                prover_available_at = now;
-            }
-            tracing::debug!("Already committed to {} orders, with a total cycle count of {}, a peak khz limit of {}, started working on them at {}, we estimate the prover will be available in {} seconds", 
-                num_commited_orders,
-                total_commited_cycles,
-                peak_prove_khz,
-                started_proving_at,
-                prover_available_at.saturating_sub(now),
-            );
-
-            // For each order in consideration, check if it can be completed before its expiration
-            // and that there is enough gas to pay for the lock and fulfillment of all orders
-            // including the committed orders.
-            for order in orders {
-                if final_orders.len() >= capacity_granted {
-                    break;
-                }
-                // Calculate gas and cost for this order using our helper method
-                let order_cost_wei = self.calculate_order_gas_cost_wei(&order, gas_price).await?;
-
-                // Skip if not enough balance
-                if order_cost_wei > remaining_balance_wei {
-                    tracing::warn!(
-                        "Insufficient balance for order {}. Required: {} ether, Remaining: {} ether",
-                        order.id(),
-                        format_ether(order_cost_wei),
-                        format_ether(remaining_balance_wei)
-                    );
-                    self.skip_order(&order, "insufficient balance").await;
-                    continue;
-                }
-
-                let Some(order_cycles) = order.total_cycles else {
-                    tracing::warn!("Order 0x{:x} has no total cycles, preflight was skipped? Not considering for peak khz limit", order.request.id);
-                    final_orders.push(order);
-                    remaining_balance_wei -= order_cost_wei;
-                    continue;
-                };
-
-                // Calculate total cycles including application proof, assessor, and set builder estimates
-                let total_cycles = order_cycles + config.additional_proof_cycles;
-
-                let proof_time_seconds = total_cycles.div_ceil(1_000).div_ceil(peak_prove_khz);
-                let completion_time = prover_available_at + proof_time_seconds;
-                let expiration = order.expiry();
-
-                if completion_time + config.batch_buffer_time_secs > expiration {
-                    // If the order cannot be completed before its expiration, skip it permanently.
-                    // Otherwise, we keep the order for the next iteration as capacity may free up in the future.
-
-                    if now + proof_time_seconds > expiration {
-                        tracing::info!("Order 0x{:x} cannot be completed before its expiration at {}, proof estimated to take {} seconds and complete at {}. Skipping", 
-                            order.request.id,
-                            expiration,
-                            proof_time_seconds,
-                            completion_time
-                        );
-                        // If the order cannot be completed regardless of other orders, skip it
-                        // permanently. Otherwise, will retry including the order.
-                        self.skip_order(&order, "cannot be completed before expiration").await;
-                    } else {
-                        tracing::debug!("Given current commited orders and capacity, order 0x{:x} cannot be completed before its expiration. Not skipping as capacity may free up before it expires.", order.request.id);
-                    }
-                    continue;
-                }
-
-                tracing::debug!("Order {} estimated to take {} seconds (including assessor + set builder), and would be completed at {} ({} seconds from now). It expires at {} ({} seconds from now)", order.id(), proof_time_seconds, completion_time, completion_time.saturating_sub(now_timestamp()), expiration, expiration.saturating_sub(now_timestamp()));
-
-                final_orders.push(order);
-                prover_available_at = completion_time;
-                remaining_balance_wei -= order_cost_wei;
-            }
-        } else {
-            // If no peak khz limit, just check gas for each order
-            for order in orders {
-                if final_orders.len() >= capacity_granted {
-                    break;
-                }
-                let order_cost_wei = self.calculate_order_gas_cost_wei(&order, gas_price).await?;
-
-                // Skip if not enough balance
-                if order_cost_wei > remaining_balance_wei {
-                    tracing::warn!(
-                        "Insufficient balance for order {}. Required: {} ether, Remaining: {} ether",
-                        order.id(),
-                        format_ether(order_cost_wei),
-                        format_ether(remaining_balance_wei)
-                    );
-                    self.skip_order(&order, "insufficient balance").await;
-                    continue;
-                }
-
-                final_orders.push(order);
-                remaining_balance_wei -= order_cost_wei;
-            }
-        }
-
-        tracing::info!(
-            "Started with {} orders ready to be locked and/or proven. Already commited to {} orders. After applying capacity limits of {} max concurrent proofs and {} peak khz, filtered to {} orders: {:?}",
-            num_orders,
-            num_commited_orders,
-            if let Some(max_concurrent_proofs) = config.max_concurrent_proofs {
-                max_concurrent_proofs.to_string()
-            } else {
-                "unlimited".to_string()
-            },
-            if let Some(peak_prove_khz) = config.peak_prove_khz {
-                peak_prove_khz.to_string()
-            } else {
-                "unlimited".to_string()
-            },
-            final_orders.len(),
-            final_orders.iter().map(|order| order.id()).collect::<Vec<_>>()
-        );
-
-        Ok(final_orders)
+        running_cost += total_cost;
+        final_orders.push(order);
     }
 
-    pub async fn start_monitor(
-        self,
-        cancel_token: CancellationToken,
-    ) -> Result<(), OrderMonitorErr> {
-        let mut last_block = 0;
-        let mut first_block = 0;
-        let mut interval = tokio::time::interval_at(
-            tokio::time::Instant::now(),
-            tokio::time::Duration::from_secs(self.block_time),
-        );
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        let mut new_orders = self.priced_order_rx.lock().await;
-        let mut prev_orders_by_status = String::new();
-
-        loop {
-            tokio::select! {
-                // Process new orders from the channel as soon as they arrive
-                biased;
-
-                Some(result) = new_orders.recv() => {
-                    self.handle_new_order_result(result).await?;
-                }
-
-                // On each interval, process all pending orders and do the block-based logic
-                _ = interval.tick() => {
-                    let ChainHead { block_number, block_timestamp } =
-                        self.chain_monitor.current_chain_head().await?;
-                    if block_number != last_block {
-                        last_block = block_number;
-                        if first_block == 0 {
-                            first_block = block_number;
-                        }
-                        tracing::trace!(
-                            "Order monitor processing block {block_number} at timestamp {block_timestamp}"
-                        );
-
-                        let monitor_config = {
-                            let config = self.config.lock_all().context("Failed to read config")?;
-                            OrderMonitorConfig {
-                                min_deadline: config.market.min_deadline,
-                                peak_prove_khz: config.market.peak_prove_khz,
-                                max_concurrent_proofs: config.market.max_concurrent_proofs,
-                                additional_proof_cycles: config.market.additional_proof_cycles,
-                                batch_buffer_time_secs: config.batcher.block_deadline_buffer_secs,
-                                order_commitment_priority: config.market.order_commitment_priority,
-                                priority_addresses: config.market.priority_requestor_addresses.clone(),
-                            }
-                        };
-
-                        // Get orders that are valid and ready for locking/proving, skipping orders that are now invalid for proving, due to expiring, being locked by another prover, etc.
-                        let mut valid_orders = self.get_valid_orders(block_timestamp, monitor_config.min_deadline).await?;
-
-                        if valid_orders.is_empty() {
-                            tracing::trace!(
-                                "No orders to lock and/or prove as of block timestamp {}",
-                                block_timestamp
-                            );
-                            continue;
-                        }
-
-                        // Prioritize the orders that intend to fulfill based on configured commitment priority.
-                        valid_orders = self.prioritize_orders(valid_orders, monitor_config.order_commitment_priority, monitor_config.priority_addresses.as_deref());
-
-                        // Filter down the orders given our max concurrent proofs, peak khz limits, and gas limitations.
-                        let final_orders = self
-                            .apply_capacity_limits(
-                                valid_orders,
-                                &monitor_config,
-                                &mut prev_orders_by_status,
-                            )
-                            .await?;
-
-                        tracing::trace!("After processing block {}[timestamp {}], we will now start locking and/or proving {} orders.",
-                            block_number,
-                            block_timestamp,
-                            final_orders.len(),
-                        );
-
-                        if !final_orders.is_empty() {
-                            // Lock and prove filtered orders.
-                            self.lock_and_prove_orders(&final_orders).await?;
-                        }
-                    }
-                }
-                _ = cancel_token.cancelled() => {
-                    tracing::debug!("Order monitor received cancellation");
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    // Called when a new order result is received from the channel
-    async fn handle_new_order_result(
-        &self,
-        order: Box<OrderRequest>,
-    ) -> Result<(), OrderMonitorErr> {
-        match order.fulfillment_type {
-            FulfillmentType::LockAndFulfill => {
-                // Note: this could be done without waiting for the batch to minimize latency, but
-                //       avoiding more complicated logic for checking capacity for each order.
-
-                // If not, add it to the cache to be locked after target time
-                self.lock_and_prove_cache.insert(order.id(), Arc::from(order)).await;
-            }
-            FulfillmentType::FulfillAfterLockExpire | FulfillmentType::FulfillWithoutLocking => {
-                self.prove_cache.insert(order.id(), Arc::from(order)).await;
-            }
-        }
-        Ok(())
-    }
+    Ok(final_orders)
 }
 
 impl<P> RetryTask for OrderMonitor<P>
